@@ -59,3 +59,11 @@ Open **http://localhost:5173** in your browser.
 | POST | `/api/dispense` | Dispense using FEFO logic |
 | GET | `/api/alerts/expiring?days=30` | Batches expiring soon |
 | GET | `/api/medicines/search?q=name` | Search medicines |
+| POST | `/clock` | Flag batches expiring within 7 days and quarantine expired batches |
+| POST | `/api/batches/import` | Import messy batch rows; returns `imported`, `deduped`, and `rejected` counts |
+| GET | `/outbox` | Notification Service outbox, including reorder alerts |
+
+Medicines accept an optional `reorderThreshold`. Dispensing below that in-date
+threshold writes a `REORDER_ALERT` event to the outbox. Import quantities may
+be formatted like `10 units`, and dates may use either `dd/mm/yyyy` or ISO
+format. Duplicate rows are counted in `deduped` rather than inserted.

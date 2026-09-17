@@ -13,7 +13,9 @@ model Medicine {
   id          String   @id @default(uuid())
   name        String   @unique
   description String?
+  reorderThreshold Int @default(0)
   batches     Batch[]
+  outboxEvents OutboxEvent[]
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 }
@@ -24,6 +26,17 @@ model Batch {
   medicine   Medicine @relation(fields: [medicineId], references: [id])
   quantity   Int
   expiryDate DateTime
+  status     String   @default("ACTIVE")
+  expiringSoon Boolean @default(false)
   createdAt  DateTime @default(now())
   updatedAt  DateTime @updatedAt
+}
+
+model OutboxEvent {
+  id         String   @id @default(uuid())
+  type       String
+  medicineId String?
+  medicine   Medicine? @relation(fields: [medicineId], references: [id])
+  payload    String
+  createdAt  DateTime @default(now())
 }

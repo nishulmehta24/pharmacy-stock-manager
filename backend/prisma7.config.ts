@@ -9,6 +9,7 @@ export default defineConfig({
     path: "prisma/migrations",
   },
   datasource: {
-    url: process.env["DATABASE_URL"],
+    // Use the local development database by default; deployments can override it.
+    url: process.env["DATABASE_URL"] ?? "file:./dev.db",
   },
 });
