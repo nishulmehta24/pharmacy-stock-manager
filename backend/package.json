@@ -6,7 +6,9 @@
     "dev": "nodemon src/index.js",
     "start": "node src/index.js",
     "test": "node --test src/index.test.js",
-    "db:push": "npx prisma db push",
+    "generate": "prisma generate",
+    "postinstall": "npm run generate",
+    "db:push": "npm run generate && prisma db push",
     "db:studio": "npx prisma studio"
   },
   "keywords": [],
