@@ -1,4 +1,4 @@
-##Git hub Copilot##
+### Git hub Copilot 
 
 ## Copilot said: The error is caused by Prisma 7 requiring `DATABASE_URL`, while the project’s config currently reads it as undefined. I’ve sent…
 
