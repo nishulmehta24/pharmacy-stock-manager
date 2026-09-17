@@ -1,5 +1,8 @@
 const express = require('express');
 const cors = require('cors');
+const multer = require('multer');
+const { parse: parseCsv } = require('csv-parse/sync');
+const XLSX = require('xlsx');
 const { PrismaClient } = require('@prisma/client');
 const { PrismaBetterSqlite3 } = require('@prisma/adapter-better-sqlite3');
 require('dotenv').config();
@@ -8,6 +11,11 @@ const app = express();
 const adapter = new PrismaBetterSqlite3({ url: process.env.DATABASE_URL || 'file:./dev.db' });
 const prisma = new PrismaClient({ adapter });
 const PORT = process.env.PORT || 3001;
+const MAX_UPLOAD_SIZE = 5 * 1024 * 1024;
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_UPLOAD_SIZE, files: 1 },
+});
 
 app.use(cors());
 app.use(express.json());
@@ -40,6 +48,75 @@ const stockWhere = (today) => ({
   quantity: { gt: 0 },
   status: 'ACTIVE',
 });
+
+const allowedUploadExtensions = new Set(['.csv', '.xlsx', '.xls']);
+const allowedUploadMimeTypes = new Set([
+  'text/csv',
+  'application/csv',
+  'application/vnd.ms-excel',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'application/octet-stream',
+]);
+
+function parseBatchFile(file) {
+  if (!file) throw new Error('A CSV or Excel file is required.');
+  const extension = file.originalname.toLowerCase().slice(file.originalname.lastIndexOf('.'));
+  if (!allowedUploadExtensions.has(extension)) {
+    throw new Error('Unsupported file type. Upload a .csv, .xlsx, or .xls file.');
+  }
+  if (file.size > MAX_UPLOAD_SIZE) {
+    throw new Error('File is too large. Maximum upload size is 5 MB.');
+  }
+  if (file.mimetype && !allowedUploadMimeTypes.has(file.mimetype)) {
+    throw new Error('Invalid file type. Upload a CSV or Excel file.');
+  }
+
+  if (extension === '.csv') {
+    return parseCsv(file.buffer.toString('utf8'), {
+      columns: true,
+      skip_empty_lines: true,
+      bom: true,
+      trim: true,
+    });
+  }
+
+  const workbook = XLSX.read(file.buffer, { type: 'buffer', cellDates: true, dense: true });
+  const sheet = workbook.Sheets[workbook.SheetNames[0]];
+  if (!sheet) throw new Error('The workbook does not contain a worksheet.');
+  return XLSX.utils.sheet_to_json(sheet, { defval: '', raw: false });
+}
+
+async function importBatchRows(rows) {
+  const report = { imported: 0, deduped: 0, rejected: 0 };
+  const seen = new Set();
+  const created = [];
+  for (const row of rows) {
+    const name = String(row?.medicineName ?? row?.medicine ?? row?.name ?? '').trim();
+    const quantity = parseQuantity(row?.quantity);
+    const expiry = parseDate(row?.expiryDate ?? row?.expiry);
+    if (!name || !Number.isInteger(quantity) || quantity <= 0 || !expiry) {
+      report.rejected += 1;
+      continue;
+    }
+    const key = `${name.toLowerCase()}|${quantity}|${expiry.toISOString().slice(0, 10)}`;
+    if (seen.has(key)) {
+      report.deduped += 1;
+      continue;
+    }
+    seen.add(key);
+    const medicine = await prisma.medicine.findUnique({ where: { name } });
+    if (!medicine) {
+      report.rejected += 1;
+      continue;
+    }
+    created.push(prisma.batch.create({
+      data: { medicineId: medicine.id, quantity, expiryDate: expiry, status: 'ACTIVE' },
+    }));
+    report.imported += 1;
+  }
+  await prisma.$transaction(created);
+  return report;
+}
 
 async function createReorderAlert(medicine, totalStock) {
   if (medicine.reorderThreshold > 0 && totalStock < medicine.reorderThreshold) {
@@ -144,11 +221,42 @@ app.post('/api/batches', async (req, res) => {
     const batch = await prisma.batch.create({
       data: { medicineId, quantity: parsedQuantity, expiryDate: expiry, status: 'ACTIVE' },
     });
+
     res.status(201).json(batch);
   } catch (error) {
     if (error.code === 'P2003') {
       return res.status(404).json({ error: 'Medicine not found.' });
     }
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/batches/:id', async (req, res) => {
+  if (!req.params.id) return res.status(400).json({ error: 'Batch id is required.' });
+  try {
+    await prisma.batch.delete({ where: { id: req.params.id } });
+    res.status(204).end();
+  } catch (error) {
+    if (error.code === 'P2025') return res.status(404).json({ error: 'Batch not found.' });
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/medicines/:id', async (req, res) => {
+  if (!req.params.id) return res.status(400).json({ error: 'Medicine id is required.' });
+  try {
+    const medicine = await prisma.medicine.findUnique({
+      where: { id: req.params.id },
+      include: { batches: { select: { id: true }, take: 1 } },
+    });
+    if (!medicine) return res.status(404).json({ error: 'Medicine not found.' });
+    if (medicine.batches.length > 0) {
+      return res.status(409).json({ error: 'Delete all batches before deleting this medicine.' });
+    }
+    await prisma.medicine.delete({ where: { id: req.params.id } });
+    res.status(204).end();
+  } catch (error) {
+    if (error.code === 'P2025') return res.status(404).json({ error: 'Medicine not found.' });
     res.status(500).json({ error: error.message });
   }
 });
@@ -317,39 +425,31 @@ app.post(['/clock', '/api/clock'], async (req, res) => {
 app.post(['/api/batches/import', '/api/import/batches', '/import'], async (req, res) => {
   const rows = Array.isArray(req.body) ? req.body : (req.body?.batches || req.body?.rows);
   if (!Array.isArray(rows)) return res.status(400).json({ error: 'Expected an array of batch rows.' });
-  const report = { imported: 0, deduped: 0, rejected: 0 };
-  const seen = new Set();
-  const created = [];
-  for (const row of rows) {
-    const name = String(row?.medicineName ?? row?.medicine ?? row?.name ?? '').trim();
-    const quantity = parseQuantity(row?.quantity);
-    const expiry = parseDate(row?.expiryDate ?? row?.expiry);
-    if (!name || !Number.isInteger(quantity) || quantity <= 0 || !expiry) {
-      report.rejected += 1;
-      continue;
-    }
-    const key = `${name.toLowerCase()}|${quantity}|${expiry.toISOString().slice(0, 10)}`;
-    if (seen.has(key)) {
-      report.deduped += 1;
-      continue;
-    }
-    seen.add(key);
-    const medicine = await prisma.medicine.findUnique({ where: { name } });
-    if (!medicine) {
-      report.rejected += 1;
-      continue;
-    }
-    created.push(prisma.batch.create({
-      data: { medicineId: medicine.id, quantity, expiryDate: expiry, status: 'ACTIVE' },
-    }));
-    report.imported += 1;
-  }
   try {
-    await prisma.$transaction(created);
-    res.status(201).json(report);
+    res.status(201).json(await importBatchRows(rows));
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
+});
+
+app.post('/api/batches/import/file', (req, res) => {
+  upload.single('file')(req, res, async (uploadError) => {
+    if (uploadError) {
+      const message = uploadError.code === 'LIMIT_FILE_SIZE'
+        ? 'File is too large. Maximum upload size is 5 MB.'
+        : 'Upload failed. Send one CSV or Excel file in the file field.';
+      return res.status(400).json({ error: message });
+    }
+    try {
+      const rows = parseBatchFile(req.file);
+      if (!Array.isArray(rows) || rows.length === 0) {
+        return res.status(400).json({ error: 'The uploaded file contains no batch rows.' });
+      }
+      return res.status(201).json(await importBatchRows(rows));
+    } catch (error) {
+      return res.status(400).json({ error: error.message });
+    }
+  });
 });
 
 app.get(['/outbox', '/api/outbox'], async (req, res) => {
@@ -372,4 +472,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { app, prisma, parseDate, parseQuantity };
+module.exports = { app, prisma, parseDate, parseQuantity, parseBatchFile, importBatchRows };

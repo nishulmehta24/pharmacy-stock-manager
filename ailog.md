@@ -1,5 +1,17 @@
 # AntiGravity
 
+## Batch file uploads and deletion
+
+Added a secure multipart upload endpoint for CSV, XLSX, and XLS batch files.
+Uploads are held in memory, limited to 5 MB and one file, checked by extension
+and MIME type, parsed server-side, and passed through the existing normalization,
+deduplication, and rejection report (`imported`, `deduped`, `rejected`).
+The React Stock tab now exposes the upload control with result/error feedback.
+
+Added confirmation-based batch deletion and medicine deletion validation:
+medicines with remaining batches return a clear conflict response. Focused
+backend tests cover CSV/XLSX parsing and invalid/oversized uploads.
+
 Load older messages
 Conversation Log
 Fixed! Now type rs in your backend terminal again and press Enter. It should start cleanly this time!
