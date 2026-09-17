@@ -1,14 +1,68 @@
 const express = require('express');
 const cors = require('cors');
 const { PrismaClient } = require('@prisma/client');
+const { PrismaBetterSqlite3 } = require('@prisma/adapter-better-sqlite3');
 require('dotenv').config();
 
 const app = express();
-const prisma = new PrismaClient();
+const adapter = new PrismaBetterSqlite3({ url: process.env.DATABASE_URL || 'file:./dev.db' });
+const prisma = new PrismaClient({ adapter });
 const PORT = process.env.PORT || 3001;
 
 app.use(cors());
 app.use(express.json());
+
+const startOfDay = (value = new Date()) => {
+  const date = new Date(value);
+  date.setHours(0, 0, 0, 0);
+  return date;
+};
+
+const parseQuantity = (value) => {
+  if (typeof value === 'number' && Number.isInteger(value)) return value;
+  if (typeof value !== 'string') return NaN;
+  const match = value.trim().match(/^(\d+)(?:\s+units?)?$/i);
+  return match ? Number(match[1]) : NaN;
+};
+
+const parseDate = (value) => {
+  if (typeof value !== 'string' && !(value instanceof Date)) return null;
+  const text = String(value).trim();
+  const ddmmyyyy = text.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  const date = ddmmyyyy
+    ? new Date(Date.UTC(Number(ddmmyyyy[3]), Number(ddmmyyyy[2]) - 1, Number(ddmmyyyy[1])))
+    : new Date(text);
+  return Number.isNaN(date.getTime()) ? null : date;
+};
+
+const stockWhere = (today) => ({
+  expiryDate: { gte: today },
+  quantity: { gt: 0 },
+  status: 'ACTIVE',
+});
+
+async function createReorderAlert(medicine, totalStock) {
+  if (medicine.reorderThreshold > 0 && totalStock < medicine.reorderThreshold) {
+    const existing = await prisma.outboxEvent.findFirst({
+      where: { type: 'REORDER_ALERT', medicineId: medicine.id },
+      orderBy: { createdAt: 'desc' },
+    });
+    if (!existing || JSON.parse(existing.payload).stock !== totalStock) {
+      await prisma.outboxEvent.create({
+        data: {
+          type: 'REORDER_ALERT',
+          medicineId: medicine.id,
+          payload: JSON.stringify({
+            medicineId: medicine.id,
+            medicineName: medicine.name,
+            stock: totalStock,
+            threshold: medicine.reorderThreshold,
+          }),
+        },
+      });
+    }
+  }
+}
 
 // ─────────────────────────────────────────────────
 // MEDICINES
@@ -23,7 +77,7 @@ app.get('/api/medicines', async (req, res) => {
     const medicines = await prisma.medicine.findMany({
       include: {
         batches: {
-          where: { expiryDate: { gte: today } },
+          where: stockWhere(today),
           orderBy: { expiryDate: 'asc' },
         },
       },
@@ -46,11 +100,15 @@ app.get('/api/medicines', async (req, res) => {
 
 // POST create a new medicine
 app.post('/api/medicines', async (req, res) => {
-  const { name, description } = req.body;
+  const { name, description, reorderThreshold = 0 } = req.body;
   if (!name) return res.status(400).json({ error: 'Medicine name is required.' });
+  const threshold = parseQuantity(reorderThreshold);
+  if (!Number.isInteger(threshold) || threshold < 0) {
+    return res.status(400).json({ error: 'reorderThreshold must be a non-negative integer.' });
+  }
 
   try {
-    const medicine = await prisma.medicine.create({ data: { name, description } });
+    const medicine = await prisma.medicine.create({ data: { name: name.trim(), description, reorderThreshold: threshold } });
     res.status(201).json(medicine);
   } catch (error) {
     if (error.code === 'P2002') {
@@ -67,23 +125,24 @@ app.post('/api/medicines', async (req, res) => {
 // POST add a new batch for a medicine
 app.post('/api/batches', async (req, res) => {
   const { medicineId, quantity, expiryDate } = req.body;
-  if (!medicineId || !quantity || !expiryDate) {
+  if (!medicineId || quantity === undefined || !expiryDate) {
     return res.status(400).json({ error: 'medicineId, quantity, and expiryDate are required.' });
   }
-  if (quantity <= 0) {
+  const parsedQuantity = parseQuantity(quantity);
+  if (!Number.isInteger(parsedQuantity) || parsedQuantity <= 0) {
     return res.status(400).json({ error: 'Quantity must be a positive number.' });
   }
 
-  const expiry = new Date(expiryDate);
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
+  const expiry = parseDate(expiryDate);
+  const today = startOfDay();
+  if (!expiry) return res.status(400).json({ error: 'expiryDate must be a valid date.' });
   if (expiry < today) {
     return res.status(400).json({ error: 'Cannot add an already-expired batch.' });
   }
 
   try {
     const batch = await prisma.batch.create({
-      data: { medicineId, quantity: parseInt(quantity), expiryDate: expiry },
+      data: { medicineId, quantity: parsedQuantity, expiryDate: expiry, status: 'ACTIVE' },
     });
     res.status(201).json(batch);
   } catch (error) {
@@ -117,8 +176,7 @@ app.post('/api/dispense', async (req, res) => {
     const batches = await prisma.batch.findMany({
       where: {
         medicineId,
-        expiryDate: { gte: today },
-        quantity: { gt: 0 },
+        ...stockWhere(today),
       },
       orderBy: { expiryDate: 'asc' },
     });
@@ -147,6 +205,9 @@ app.post('/api/dispense', async (req, res) => {
 
     await prisma.$transaction(updates);
 
+    const medicine = await prisma.medicine.findUnique({ where: { id: medicineId } });
+    if (medicine) await createReorderAlert(medicine, totalAvailable - requested);
+
     res.json({
       success: true,
       message: `Successfully dispensed ${requested} unit(s) using FEFO.`,
@@ -173,6 +234,7 @@ app.get('/api/alerts/expiring', async (req, res) => {
       where: {
         expiryDate: { gte: today, lte: threshold },
         quantity: { gt: 0 },
+        status: 'ACTIVE',
       },
       include: { medicine: { select: { name: true } } },
       orderBy: { expiryDate: 'asc' },
@@ -201,7 +263,7 @@ app.get('/api/medicines/search', async (req, res) => {
       where: { name: { contains: q } },
       include: {
         batches: {
-          where: { expiryDate: { gte: today }, quantity: { gt: 0 } },
+          where: stockWhere(today),
           orderBy: { expiryDate: 'asc' },
         },
       },
@@ -221,7 +283,93 @@ app.get('/api/medicines/search', async (req, res) => {
   }
 });
 
-// Start server
-app.listen(PORT, () => {
-  console.log(`Pharmacy API running at http://localhost:${PORT}`);
+// Daily inventory automation: flag near-expiry stock and quarantine expired stock.
+app.post(['/clock', '/api/clock'], async (req, res) => {
+  try {
+    const today = startOfDay(req.body?.date || req.body?.now || new Date());
+    const soon = new Date(today);
+    soon.setDate(soon.getDate() + 7);
+    const expired = await prisma.batch.updateMany({
+      where: { expiryDate: { lt: today }, quantity: { gt: 0 }, status: { not: 'QUARANTINED' } },
+      data: { status: 'QUARANTINED', expiringSoon: false },
+    });
+    const flagged = await prisma.batch.updateMany({
+      where: { expiryDate: { gte: today, lte: soon }, quantity: { gt: 0 }, status: 'ACTIVE' },
+      data: { expiringSoon: true },
+    });
+    const cleared = await prisma.batch.updateMany({
+      where: { OR: [{ expiryDate: { gt: soon } }, { quantity: 0 }], expiringSoon: true },
+      data: { expiringSoon: false },
+    });
+    res.json({
+      flagged: flagged.count,
+      flaggedExpiring: flagged.count,
+      quarantined: expired.count,
+      quarantinedExpired: expired.count,
+      cleared: cleared.count,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
+
+// Import accepts a raw array or { batches }, normalizing common messy values.
+app.post(['/api/batches/import', '/api/import/batches', '/import'], async (req, res) => {
+  const rows = Array.isArray(req.body) ? req.body : (req.body?.batches || req.body?.rows);
+  if (!Array.isArray(rows)) return res.status(400).json({ error: 'Expected an array of batch rows.' });
+  const report = { imported: 0, deduped: 0, rejected: 0 };
+  const seen = new Set();
+  const created = [];
+  for (const row of rows) {
+    const name = String(row?.medicineName ?? row?.medicine ?? row?.name ?? '').trim();
+    const quantity = parseQuantity(row?.quantity);
+    const expiry = parseDate(row?.expiryDate ?? row?.expiry);
+    if (!name || !Number.isInteger(quantity) || quantity <= 0 || !expiry) {
+      report.rejected += 1;
+      continue;
+    }
+    const key = `${name.toLowerCase()}|${quantity}|${expiry.toISOString().slice(0, 10)}`;
+    if (seen.has(key)) {
+      report.deduped += 1;
+      continue;
+    }
+    seen.add(key);
+    const medicine = await prisma.medicine.findUnique({ where: { name } });
+    if (!medicine) {
+      report.rejected += 1;
+      continue;
+    }
+    created.push(prisma.batch.create({
+      data: { medicineId: medicine.id, quantity, expiryDate: expiry, status: 'ACTIVE' },
+    }));
+    report.imported += 1;
+  }
+  try {
+    await prisma.$transaction(created);
+    res.status(201).json(report);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get(['/outbox', '/api/outbox'], async (req, res) => {
+  try {
+    const events = await prisma.outboxEvent.findMany({ orderBy: { createdAt: 'asc' } });
+    res.json(events.map((event) => ({
+      ...event,
+      eventType: event.type,
+      payload: JSON.parse(event.payload),
+    })));
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Start server
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`Pharmacy API running at http://localhost:${PORT}`);
+  });
+}
+
+module.exports = { app, prisma, parseDate, parseQuantity };
