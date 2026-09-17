@@ -28,7 +28,7 @@ pharmacy-stock-manager/
 │   └── src/App.jsx         # React UI
 ├── README.md
 ├── reasoning.md
-└── ai_logs.txt
+└── ailog.md
 ```
 
 ## Quick Start
