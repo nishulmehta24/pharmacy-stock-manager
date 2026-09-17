@@ -81,6 +81,7 @@ export default function App() {
   const [alerts, setAlerts] = useState([])
   const [toast, setToast] = useState(null)
   const [loading, setLoading] = useState(false)
+  const [uploading, setUploading] = useState(false)
 
   const notify = (msg, type = 'success') => setToast({ msg, type })
 
@@ -127,6 +128,47 @@ export default function App() {
     } catch (err) {
       notify(err.response?.data?.error || 'Error adding batch.', 'error')
     } finally { setLoading(false) }
+  }
+
+  const deleteBatch = async (batchId) => {
+    if (!window.confirm('Delete this batch? This cannot be undone.')) return
+    try {
+      setLoading(true)
+      await axios.delete(`${API}/batches/${batchId}`)
+      notify('Batch deleted.')
+      fetchAll()
+    } catch (err) {
+      notify(err.response?.data?.error || 'Error deleting batch.', 'error')
+    } finally { setLoading(false) }
+  }
+
+  const deleteMedicine = async (medicine) => {
+    if (!window.confirm(`Delete "${medicine.name}"? Medicines with batches must be emptied first.`)) return
+    try {
+      setLoading(true)
+      await axios.delete(`${API}/medicines/${medicine.id}`)
+      notify(`Medicine "${medicine.name}" deleted.`)
+      fetchAll()
+    } catch (err) {
+      notify(err.response?.data?.error || 'Error deleting medicine.', 'error')
+    } finally { setLoading(false) }
+  }
+
+  const uploadBatchFile = async (e) => {
+    const file = e.target.files?.[0]
+    e.target.value = ''
+    if (!file) return
+    const data = new FormData()
+    data.append('file', file)
+    try {
+      setUploading(true)
+      const res = await axios.post(`${API}/batches/import/file`, data)
+      const { imported, deduped, rejected } = res.data
+      notify(`Imported ${imported}; skipped ${deduped} duplicates and rejected ${rejected}.`)
+      fetchAll()
+    } catch (err) {
+      notify(err.response?.data?.error || 'Error uploading batch file.', 'error')
+    } finally { setUploading(false) }
   }
 
   // ── Dispense ──────────────────────────────────────────────────────────────
@@ -283,6 +325,14 @@ export default function App() {
               </form>
             </Card>
 
+            <Card title="📤 Import Batch File">
+              <p className="text-sm text-gray-500 mb-3">Upload CSV, XLSX, or XLS (maximum 5 MB). Use columns medicineName, quantity, and expiryDate.</p>
+              <label className="inline-flex items-center justify-center px-4 py-2 rounded-lg text-sm font-medium bg-blue-600 hover:bg-blue-700 text-white cursor-pointer">
+                {uploading ? 'Uploading…' : 'Choose batch file'}
+                <input type="file" accept=".csv,.xlsx,.xls,text/csv" className="hidden" onChange={uploadBatchFile} disabled={uploading} />
+              </label>
+            </Card>
+
             <Card title="📥 Add Batch to Existing Medicine">
               <form onSubmit={addBatch} className="flex flex-col gap-3">
                 <div className="flex flex-col gap-1">
@@ -304,20 +354,27 @@ export default function App() {
             {/* Per-medicine batch detail */}
             <div className="md:col-span-2">
               <Card title="🗃️ Batch Details (In-Date Only)">
-                {medicines.map(m => m.batches?.length > 0 && (
+                {medicines.map(m => (
                   <div key={m.id} className="mb-4">
-                    <p className="font-semibold text-gray-700 mb-1">{m.name}</p>
+                    <div className="flex items-center justify-between mb-1">
+                      <p className="font-semibold text-gray-700">{m.name}</p>
+                      <Btn variant="danger" type="button" onClick={() => deleteMedicine(m)} disabled={loading}>Delete medicine</Btn>
+                    </div>
                     <table className="w-full text-sm">
                       <thead><tr className="text-left text-gray-400 border-b">
-                        <th className="pb-1">Qty</th><th className="pb-1">Expires</th>
+                        <th className="pb-1">Qty</th><th className="pb-1">Expires</th><th className="pb-1 text-right">Actions</th>
                       </tr></thead>
                       <tbody>
-                        {m.batches.map(b => (
+                        {m.batches?.map(b => (
                           <tr key={b.id} className="border-b last:border-0">
                             <td className="py-1">{b.quantity}</td>
                             <td className="py-1">{new Date(b.expiryDate).toLocaleDateString()}</td>
+                            <td className="py-1 text-right"><Btn variant="danger" type="button" onClick={() => deleteBatch(b.id)} disabled={loading}>Delete</Btn></td>
                           </tr>
                         ))}
+                        {(!m.batches || m.batches.length === 0) && (
+                          <tr><td colSpan={3} className="py-2 text-sm text-gray-400">No batches.</td></tr>
+                        )}
                       </tbody>
                     </table>
                   </div>

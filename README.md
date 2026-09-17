@@ -9,6 +9,8 @@ A full-stack web application for managing pharmacy inventory using **First-Expir
 - ✅ Expiry alerts for batches expiring within 30 days
 - ✅ Search medicines by name ("do we have paracetamol in date?")
 - ✅ Clean React dashboard UI
+- ✅ CSV/XLSX/XLS batch file uploads with validation and import reports
+- ✅ Confirmed deletion of batches; medicines can be deleted after their batches are removed
 
 ## Tech Stack
 | Layer | Technology |
@@ -61,9 +63,17 @@ Open **http://localhost:5173** in your browser.
 | GET | `/api/medicines/search?q=name` | Search medicines |
 | POST | `/clock` | Flag batches expiring within 7 days and quarantine expired batches |
 | POST | `/api/batches/import` | Import messy batch rows; returns `imported`, `deduped`, and `rejected` counts |
+| POST | `/api/batches/import/file` | Upload one CSV/XLSX/XLS file in the `file` field (maximum 5 MB) |
+| DELETE | `/api/batches/:id` | Delete a batch after confirmation |
+| DELETE | `/api/medicines/:id` | Delete an empty medicine; returns 409 while batches remain |
 | GET | `/outbox` | Notification Service outbox, including reorder alerts |
 
 Medicines accept an optional `reorderThreshold`. Dispensing below that in-date
 threshold writes a `REORDER_ALERT` event to the outbox. Import quantities may
 be formatted like `10 units`, and dates may use either `dd/mm/yyyy` or ISO
 format. Duplicate rows are counted in `deduped` rather than inserted.
+
+Batch files must include `medicineName` (or `medicine`/`name`), `quantity`, and
+`expiryDate` (or `expiry`) columns. Unsupported types, malformed rows, and
+unknown medicines are rejected explicitly. The Stock tab provides the upload
+control and confirmation-based delete actions.
